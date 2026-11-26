@@ -281,7 +281,7 @@ class Renderer {
       return null;
     }
 
-    if (self::canonicalizeHost($parsedPattern['host']) === null) {
+    if (self::canonicalizeHost($parsedPattern['host'], true) === null) {
       return null;
     }
 
@@ -464,9 +464,13 @@ class Renderer {
     return $params;
   }
 
-  private static function canonicalizeHost(string $host): ?string {
+  private static function canonicalizeHost(string $host, bool $allowWildcard = false): ?string {
     $host = strtolower(rawurldecode($host));
     if ($host === '') {
+      return null;
+    }
+
+    if (!$allowWildcard && strpos($host, '*') !== false) {
       return null;
     }
 
@@ -488,7 +492,10 @@ class Renderer {
       $flags = defined('IDNA_NONTRANSITIONAL_TO_ASCII') ? IDNA_NONTRANSITIONAL_TO_ASCII : IDNA_DEFAULT;
       $labels = explode('.', $host);
       foreach ($labels as &$label) {
-        if ($label !== '' && strpos($label, '*') === false && preg_match('/[^\x00-\x7f]/', $label)) {
+        if ($label !== '' && preg_match('/[^\x00-\x7f]/', $label)) {
+          if (strpos($label, '*') !== false) {
+            return null;
+          }
           $idnaInfo = [];
           $ascii = idn_to_ascii($label, $flags, INTL_IDNA_VARIANT_UTS46, $idnaInfo);
           if ($ascii === false || ($idnaInfo['errors'] ?? 0) !== 0) {
@@ -582,8 +589,8 @@ class Renderer {
   }
 
   private static function matchHost(string $host, string $pattern): bool {
-    $host = self::canonicalizeHost($host);
-    $pattern = self::canonicalizeHost($pattern);
+    $host = self::canonicalizeHost($host, false);
+    $pattern = self::canonicalizeHost($pattern, true);
 
     if ($host === null || $pattern === null) {
       return false;
