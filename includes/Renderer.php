@@ -11,6 +11,9 @@ use MediaWiki\Parser\Sanitizer;
 
 class Renderer {
   const IMG_SELF_CLOSING_MARK = 'data-img-unsafe-self-closing';
+  private const MAX_HOST_LENGTH = 253;
+  private const MAX_RAW_HOST_LENGTH = 1024;
+  private static array $loggedConfigErrors = [];
 
   public static function createImgElement(array $attribs = []) {
     $src = $attribs['src'] ?? '';
@@ -185,20 +188,20 @@ class Renderer {
     }
 
     // Check against whitelist (白名单与黑名单互斥，若同时设置则只使用白名单)
-    if (!is_array($whiteList)) {
-      return $status->newFatal('imgtag-not-whitelisted-src');
+    if (!self::validateListConfig('MoeImgTagWhitelist', $whiteList)) {
+      return $status->newFatal('imgtag-invalid-config');
     }
     if ($whiteList !== []) {
-      if (!self::areValidPatterns($whiteList) || !self::checkUrlMatch($src, $whiteList)) {
+      if (!self::checkUrlMatch($src, $whiteList)) {
         return $status->newFatal('imgtag-not-whitelisted-src');
       }
     } else {
       // Check against blacklist
-      if (!is_array($blackList)) {
-        return $status->newFatal('imgtag-blacklisted-src');
+      if (!self::validateListConfig('MoeImgTagBlacklist', $blackList)) {
+        return $status->newFatal('imgtag-invalid-config');
       }
       if ($blackList !== []) {
-        if (!self::areValidPatterns($blackList) || self::checkUrlMatch($src, $blackList)) {
+        if (self::checkUrlMatch($src, $blackList)) {
           return $status->newFatal('imgtag-blacklisted-src');
         }
       }
@@ -207,13 +210,47 @@ class Renderer {
     return $status;
   }
 
-  private static function areValidPatterns(array $patterns): bool {
-    foreach ($patterns as $pattern) {
+  public static function validateConfig(): bool {
+    $conf = MediaWikiServices::getInstance()->getMainConfig();
+    $whiteListOk = self::validateListConfig('MoeImgTagWhitelist', $conf->get('MoeImgTagWhitelist'));
+    $blackListOk = self::validateListConfig('MoeImgTagBlacklist', $conf->get('MoeImgTagBlacklist'));
+    return $whiteListOk && $blackListOk;
+  }
+
+  private static function validateListConfig(string $configName, $patterns): bool {
+    if (!is_array($patterns)) {
+      self::logConfigErrorOnce(
+        $configName,
+        "Invalid \$wg{$configName} configuration: expected array, got " . gettype($patterns)
+      );
+      return false;
+    }
+
+    foreach ($patterns as $index => $pattern) {
       if (!is_string($pattern) || self::parsePattern($pattern) === null) {
+        self::logConfigErrorOnce(
+          $configName,
+          "Invalid pattern at index {$index} in \$wg{$configName}"
+        );
         return false;
       }
     }
+
     return true;
+  }
+
+  private static function logConfigErrorOnce(string $configName, string $message): void {
+    $key = $configName . ':' . $message;
+    if (isset(self::$loggedConfigErrors[$key])) {
+      return;
+    }
+    self::$loggedConfigErrors[$key] = true;
+
+    if (class_exists(\MediaWiki\Logger\LoggerFactory::class)) {
+      \MediaWiki\Logger\LoggerFactory::getInstance('MoeImgTag')->error($message);
+    } elseif (function_exists('wfLogWarning')) {
+      wfLogWarning("[MoeImgTag] {$message}");
+    }
   }
 
   /**
@@ -244,6 +281,15 @@ class Renderer {
     $parsedUrl = parse_url($normalizedUrl);
     if ($parsedUrl === false || !isset($parsedUrl['host']) || $parsedUrl['host'] === '') {
       return false; // 无效的 URL
+    }
+
+    // 仅允许 http/https 协议（或未展开的 // 协议相对 URL），防止外部调用方误放行非 HTTP(S) 协议
+    if (isset($parsedUrl['scheme'])) {
+      if (!in_array(strtolower($parsedUrl['scheme']), ['http', 'https'], true)) {
+        return false;
+      }
+    } elseif (!str_starts_with($normalizedUrl, '//')) {
+      return false;
     }
 
     // 拒绝包含 .. 路径遍历段（含多次编码）的 URL
@@ -278,6 +324,11 @@ class Renderer {
     $isProtocolRelative = strpos($pattern, '//') === 0;
     $parsedPattern = parse_url(($hasScheme || $isProtocolRelative) ? $pattern : '//' . $pattern);
     if ($parsedPattern === false || !isset($parsedPattern['host']) || $parsedPattern['host'] === '') {
+      return null;
+    }
+
+    if (isset($parsedPattern['scheme']) &&
+        !in_array(strtolower($parsedPattern['scheme']), ['http', 'https'], true)) {
       return null;
     }
 
@@ -465,8 +516,12 @@ class Renderer {
   }
 
   private static function canonicalizeHost(string $host, bool $allowWildcard = false): ?string {
+    if ($host === '' || strlen($host) > self::MAX_RAW_HOST_LENGTH) {
+      return null;
+    }
+
     $host = strtolower(rawurldecode($host));
-    if ($host === '') {
+    if ($host === '' || strlen($host) > self::MAX_RAW_HOST_LENGTH) {
       return null;
     }
 
@@ -511,8 +566,9 @@ class Renderer {
     if (str_ends_with($host, '.')) {
       $host = substr($host, 0, -1);
     }
-    if ($host === '' || $host[0] === '.' || str_ends_with($host, '.') ||
-        strpos($host, '..') !== false || preg_match('/[\s\/\\\\@:]/', $host)) {
+    if ($host === '' || strlen($host) > self::MAX_HOST_LENGTH || $host[0] === '.' ||
+        str_ends_with($host, '.') || strpos($host, '..') !== false ||
+        preg_match('/[\s\/\\\\@:]/', $host)) {
       return null;
     }
 
@@ -628,34 +684,43 @@ class Renderer {
   }
 
   private static function matchGlob(string $pattern, string $text): bool {
-    $pLen = strlen($pattern);
-    $tLen = strlen($text);
-    $p = 0;
-    $t = 0;
-    $starIdx = -1;
-    $matchIdx = 0;
+    $parts = explode('*', $pattern);
+    $partCount = count($parts);
+    if ($partCount === 1) {
+      return $pattern === $text;
+    }
 
-    while ($t < $tLen) {
-      if ($p < $pLen && $pattern[$p] === $text[$t]) {
-        $p++;
-        $t++;
-      } elseif ($p < $pLen && $pattern[$p] === '*') {
-        $starIdx = $p;
-        $matchIdx = $t;
-        $p++;
-      } elseif ($starIdx !== -1) {
-        $p = $starIdx + 1;
-        $matchIdx++;
-        $t = $matchIdx;
-      } else {
+    $prefix = $parts[0];
+    if ($prefix !== '' && !str_starts_with($text, $prefix)) {
+      return false;
+    }
+    $pos = strlen($prefix);
+
+    $suffix = $parts[$partCount - 1];
+    $end = strlen($text);
+    if ($suffix !== '') {
+      if (!str_ends_with($text, $suffix)) {
         return false;
       }
+      $end -= strlen($suffix);
     }
 
-    while ($p < $pLen && $pattern[$p] === '*') {
-      $p++;
+    if ($pos > $end) {
+      return false;
     }
 
-    return $p === $pLen;
+    for ($i = 1; $i < $partCount - 1; $i++) {
+      $segment = $parts[$i];
+      if ($segment === '') {
+        continue;
+      }
+      $found = strpos($text, $segment, $pos);
+      if ($found === false || $found + strlen($segment) > $end) {
+        return false;
+      }
+      $pos = $found + strlen($segment);
+    }
+
+    return true;
   }
 }

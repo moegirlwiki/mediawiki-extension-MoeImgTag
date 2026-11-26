@@ -4,5 +4,6 @@
   "imgtag-empty-src": "未设置 <code>src</code> 属性。",
   "imgtag-invalid-src": "无效的 <code>src</code> 属性",
   "imgtag-not-whitelisted-src": "该 <code>src</code> 属性未被列入白名单。",
-  "imgtag-blacklisted-src": "该 <code>src</code> 属性被列入黑名单。"
+  "imgtag-blacklisted-src": "该 <code>src</code> 属性被列入黑名单。",
+  "imgtag-invalid-config": "MoeImgTag 白名单或黑名单配置无效，请联系站点管理员。"
 }
