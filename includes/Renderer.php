@@ -171,17 +171,36 @@ class Renderer {
       return $status->newFatal('imgtag-invalid-src');
     }
 
+    // 若缺少 intl 扩展且主机名含非 ASCII 字符，无法进行可靠的 IDNA 规范化，拒绝该 URL
+    $decodedHost = rawurldecode($parsedSrc['host']);
+    if (preg_match('/[^\x00-\x7f]/', $decodedHost) && !function_exists('idn_to_ascii')) {
+      return $status->newFatal('imgtag-invalid-src');
+    }
+
     // Check against whitelist
-    if (!empty($whiteList) && !self::checkUrlMatch($src, $whiteList)) {
-      return $status->newFatal('imgtag-not-whitelisted-src');
+    if (!empty($whiteList)) {
+      if (!is_array($whiteList) || !self::areValidPatterns($whiteList) || !self::checkUrlMatch($src, $whiteList)) {
+        return $status->newFatal('imgtag-not-whitelisted-src');
+      }
     }
 
     // Check against blacklist
-    if (!empty($blackList) && self::checkUrlMatch($src, $blackList)) {
-      return $status->newFatal('imgtag-blacklisted-src');
+    if (!empty($blackList)) {
+      if (!is_array($blackList) || !self::areValidPatterns($blackList) || self::checkUrlMatch($src, $blackList)) {
+        return $status->newFatal('imgtag-blacklisted-src');
+      }
     }
 
     return $status;
+  }
+
+  private static function areValidPatterns(array $patterns): bool {
+    foreach ($patterns as $pattern) {
+      if (!is_string($pattern) || trim($pattern) === '') {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -320,8 +339,9 @@ class Renderer {
 
   private static function hasTraversalSegment(string $path): bool {
     $current = $path;
-    for ($i = 0; $i < 10; $i++) {
-      if (in_array('..', explode('/', $current), true)) {
+    while (true) {
+      $normalizedSeparators = str_replace('\\', '/', $current);
+      if (in_array('..', explode('/', $normalizedSeparators), true)) {
         return true;
       }
       $next = rawurldecode($current);
@@ -330,11 +350,11 @@ class Renderer {
       }
       $current = $next;
     }
-    return in_array('..', explode('/', $current), true);
+    return false;
   }
 
   private static function normalizePath(string $path): string {
-    $decoded = rawurldecode($path);
+    $decoded = str_replace('\\', '/', rawurldecode($path));
     $segments = explode('/', $decoded);
     $resolved = [];
 
@@ -394,12 +414,13 @@ class Renderer {
       return $canonicalIpv4;
     }
 
-    // 处理国际化域名 (IDNA)
+    // 处理国际化域名 (IDNA，使用非过渡模式以匹配现代浏览器解析)
     if (preg_match('/[^\x00-\x7f]/', $host) && function_exists('idn_to_ascii')) {
+      $flags = defined('IDNA_NONTRANSITIONAL_TO_ASCII') ? IDNA_NONTRANSITIONAL_TO_ASCII : IDNA_DEFAULT;
       $labels = explode('.', $host);
       foreach ($labels as &$label) {
         if ($label !== '' && strpos($label, '*') === false && preg_match('/[^\x00-\x7f]/', $label)) {
-          $ascii = idn_to_ascii($label, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
+          $ascii = idn_to_ascii($label, $flags, INTL_IDNA_VARIANT_UTS46);
           if ($ascii !== false) {
             $label = $ascii;
           }
@@ -450,7 +471,10 @@ class Renderer {
   }
 
   private static function parseIpv4Number(string $input): ?int {
-    if (preg_match('/^0[xX]([0-9a-fA-F]+)$/', $input, $m)) {
+    if (preg_match('/^0[xX]([0-9a-fA-F]*)$/', $input, $m)) {
+      if ($m[1] === '') {
+        return 0;
+      }
       $val = hexdec($m[1]);
       return is_int($val) && $val >= 0 && $val <= 0xFFFFFFFF ? $val : null;
     }
@@ -476,6 +500,12 @@ class Renderer {
     $pattern = self::canonicalizeHost($pattern);
 
     if ($host === '' || $pattern === '' || $host[0] === '.') {
+      return false;
+    }
+
+    // 若无法通过 intl 规范化 IDN 且仍包含非 ASCII 字符，则拒绝比较
+    if ((preg_match('/[^\x00-\x7f]/', $host) || preg_match('/[^\x00-\x7f]/', $pattern)) &&
+        !function_exists('idn_to_ascii')) {
       return false;
     }
 
