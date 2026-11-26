@@ -261,8 +261,8 @@ class Renderer {
   }
 
   private static function normalizeUrlForParsing(string $url): string {
-    // 浏览器会在解析 HTTP(S) URL 前去除 ASCII 控制字符，并将路径/权限部中的反斜杠视为正斜杠
-    $url = preg_replace('/[\x00-\x1f\x7f]/', '', $url);
+    // 浏览器会在解析 HTTP(S) URL 前去除首尾空白与 ASCII 控制字符，并将路径/权限部中的反斜杠视为正斜杠
+    $url = trim(preg_replace('/[\x00-\x1f\x7f]/', '', $url));
     $splitPos = strcspn($url, '?#');
     $authorityAndPath = str_replace('\\', '/', substr($url, 0, $splitPos));
     return $authorityAndPath . substr($url, $splitPos);
@@ -413,8 +413,10 @@ class Renderer {
     $trimmed = str_starts_with($path, '/') ? substr($path, 1) : $path;
     $segments = explode('/', $trimmed);
     $resolved = [];
+    $lastIndex = count($segments) - 1;
+    $endsWithDot = false;
 
-    foreach ($segments as $segment) {
+    foreach ($segments as $idx => $segment) {
       // 仅对非 %25 / %2F / %5C 的转义解码，并统一保留转义的大小写形式，防止 %252F 折叠为 %2F
       $decodedSegment = preg_replace_callback(
         '/%[0-9a-fA-F]{2}/',
@@ -428,12 +430,20 @@ class Renderer {
         $segment
       );
       if ($decodedSegment === '.') {
+        if ($idx === $lastIndex) {
+          $endsWithDot = true;
+        }
         continue;
       }
       $resolved[] = $decodedSegment;
     }
 
-    return '/' . implode('/', $resolved);
+    $normalized = '/' . implode('/', $resolved);
+    if ($endsWithDot && $normalized !== '/' && !str_ends_with($normalized, '/')) {
+      $normalized .= '/';
+    }
+
+    return $normalized;
   }
 
   private static function parseQueryPreservingDuplicates(string $query): array {
@@ -456,11 +466,7 @@ class Renderer {
 
   private static function canonicalizeHost(string $host): ?string {
     $host = strtolower(rawurldecode($host));
-    // 浏览器仅将单个末尾点视为规范 FQDN，连续点（如 example.com..）为非法主机名
-    if (str_ends_with($host, '.')) {
-      $host = substr($host, 0, -1);
-    }
-    if ($host === '' || $host[0] === '.' || str_ends_with($host, '.') || strpos($host, '..') !== false) {
+    if ($host === '') {
       return null;
     }
 
@@ -474,13 +480,7 @@ class Renderer {
       return '[' . inet_ntop($packed) . ']';
     }
 
-    // 处理浏览器兼容的 IPv4 多种写法（十进制整数、十六进制、八进制、简写等）
-    $canonicalIpv4 = self::canonicalizeIpv4($host);
-    if ($canonicalIpv4 !== null) {
-      return $canonicalIpv4;
-    }
-
-    // 处理国际化域名 (IDNA，使用非过渡模式以匹配现代浏览器解析；转换失败直接拒绝)
+    // 先处理国际化域名 (IDNA 非过渡模式)，使全角点（如 。）等字符先转换为标准 ASCII 点再做后续校验
     if (preg_match('/[^\x00-\x7f]/', $host)) {
       if (!function_exists('idn_to_ascii')) {
         return null;
@@ -498,6 +498,21 @@ class Renderer {
         }
       }
       $host = implode('.', $labels);
+    }
+
+    // 浏览器仅将单个末尾点视为规范 FQDN，连续点（如 example.com..）为非法主机名
+    if (str_ends_with($host, '.')) {
+      $host = substr($host, 0, -1);
+    }
+    if ($host === '' || $host[0] === '.' || str_ends_with($host, '.') ||
+        strpos($host, '..') !== false || preg_match('/[\s\/\\\\@:]/', $host)) {
+      return null;
+    }
+
+    // 处理浏览器兼容的 IPv4 多种写法（十进制整数、十六进制、八进制、简写等）
+    $canonicalIpv4 = self::canonicalizeIpv4($host);
+    if ($canonicalIpv4 !== null) {
+      return $canonicalIpv4;
     }
 
     return $host;
