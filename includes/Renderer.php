@@ -167,6 +167,15 @@ class Renderer {
       return $status->newFatal('imgtag-invalid-src');
     }
 
+    // 仅允许 http/https 协议（以及未展开的 // 协议相对 URL），防止 gopher:/ws: 等未知协议绕过
+    if (isset($parsedSrc['scheme'])) {
+      if (!in_array(strtolower($parsedSrc['scheme']), ['http', 'https'], true)) {
+        return $status->newFatal('imgtag-invalid-src');
+      }
+    } elseif (!str_starts_with($normalizedForParse, '//')) {
+      return $status->newFatal('imgtag-invalid-src');
+    }
+
     if (isset($parsedSrc['path']) && self::hasTraversalSegment($parsedSrc['path'])) {
       return $status->newFatal('imgtag-invalid-src');
     }
@@ -447,8 +456,11 @@ class Renderer {
 
   private static function canonicalizeHost(string $host): ?string {
     $host = strtolower(rawurldecode($host));
-    $host = rtrim($host, '.');
-    if ($host === '' || $host[0] === '.') {
+    // 浏览器仅将单个末尾点视为规范 FQDN，连续点（如 example.com..）为非法主机名
+    if (str_ends_with($host, '.')) {
+      $host = substr($host, 0, -1);
+    }
+    if ($host === '' || $host[0] === '.' || str_ends_with($host, '.') || strpos($host, '..') !== false) {
       return null;
     }
 
@@ -568,17 +580,26 @@ class Renderer {
 
     // 前导 *. 通配符必须匹配至少一个非空子域名标签，不能匹配根域名本身
     if (str_starts_with($pattern, '*.')) {
-      $suffix = substr($pattern, 1);
-      if (!str_ends_with($host, $suffix) || strlen($host) <= strlen($suffix)) {
-        return false;
+      $rest = substr($pattern, 2);
+      if (strpos($rest, '*') === false) {
+        $suffix = '.' . $rest;
+        if (!str_ends_with($host, $suffix) || strlen($host) <= strlen($suffix)) {
+          return false;
+        }
+        $sub = substr($host, 0, -strlen($suffix));
+        return $sub !== '' && !str_ends_with($sub, '.');
       }
-      $sub = substr($host, 0, -strlen($suffix));
-      if ($sub === '' || str_ends_with($sub, '.')) {
-        return false;
+
+      // 若后续模式仍含 *（如 *.cdn.*.example.com），要求至少跳过一个非空子域名标签和点
+      $offset = 0;
+      while (($dotPos = strpos($host, '.', $offset)) !== false) {
+        if ($dotPos > 0 && $host[$dotPos - 1] !== '.' &&
+            self::matchGlob($rest, substr($host, $dotPos + 1))) {
+          return true;
+        }
+        $offset = $dotPos + 1;
       }
-      if (strpos($suffix, '*') === false) {
-        return true;
-      }
+      return false;
     }
 
     return self::matchGlob($pattern, $host);
