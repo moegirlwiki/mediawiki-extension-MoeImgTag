@@ -179,6 +179,10 @@ class Renderer {
       return $status->newFatal('imgtag-invalid-src');
     }
 
+    if (isset($parsedSrc['port']) && ($parsedSrc['port'] < 1 || $parsedSrc['port'] > 65535)) {
+      return $status->newFatal('imgtag-invalid-src');
+    }
+
     if (isset($parsedSrc['path']) && self::hasTraversalSegment($parsedSrc['path'])) {
       return $status->newFatal('imgtag-invalid-src');
     }
@@ -277,6 +281,10 @@ class Renderer {
    * @return bool 如果 URL 匹配任意一个模式，则返回 true；否则返回 false
    */
   public static function checkUrlMatch(string $url, array $patterns): bool {
+    if (preg_match('/[\x00-\x1f\x7f]/', $url)) {
+      return false;
+    }
+
     $normalizedUrl = self::normalizeUrlForParsing($url);
     $parsedUrl = parse_url($normalizedUrl);
     if ($parsedUrl === false || !isset($parsedUrl['host']) || $parsedUrl['host'] === '') {
@@ -289,6 +297,10 @@ class Renderer {
         return false;
       }
     } elseif (!str_starts_with($normalizedUrl, '//')) {
+      return false;
+    }
+
+    if (isset($parsedUrl['port']) && ($parsedUrl['port'] < 1 || $parsedUrl['port'] > 65535)) {
       return false;
     }
 
@@ -327,8 +339,16 @@ class Renderer {
       return null;
     }
 
+    if (isset($parsedPattern['user']) || isset($parsedPattern['pass'])) {
+      return null;
+    }
+
     if (isset($parsedPattern['scheme']) &&
         !in_array(strtolower($parsedPattern['scheme']), ['http', 'https'], true)) {
+      return null;
+    }
+
+    if (isset($parsedPattern['port']) && ($parsedPattern['port'] < 1 || $parsedPattern['port'] > 65535)) {
       return null;
     }
 
@@ -340,6 +360,7 @@ class Renderer {
       return null;
     }
 
+    $parsedPattern['_isProtocolRelative'] = $isProtocolRelative;
     return $parsedPattern;
   }
 
@@ -362,7 +383,7 @@ class Renderer {
       return false;
     }
 
-    // 端口校验：模式指定了端口则精确匹配；模式指定了协议但未指定端口时，校验是否为该协议默认端口
+    // 端口校验：模式指定了端口则精确匹配；模式指定了协议或使用 // 协议相对格式但省略端口时，校验是否为默认端口
     $urlPort = $parsedUrl['port'] ?? self::getDefaultPort($urlScheme);
     if (isset($parsedPattern['port'])) {
       if ($urlPort !== $parsedPattern['port']) {
@@ -371,6 +392,11 @@ class Renderer {
     } elseif ($patternScheme !== null) {
       $defaultPatternPort = self::getDefaultPort($patternScheme);
       if ($defaultPatternPort !== null && $urlPort !== $defaultPatternPort) {
+        return false;
+      }
+    } elseif (!empty($parsedPattern['_isProtocolRelative'])) {
+      $defaultUrlPort = self::getDefaultPort($urlScheme);
+      if ($defaultUrlPort !== null && $urlPort !== $defaultUrlPort) {
         return false;
       }
     }
@@ -431,7 +457,10 @@ class Renderer {
     return false;
   }
 
-  private static function segmentDecodesToTraversal(string $segment): bool {
+  private static function segmentDecodesToTraversal(string $segment, int $depth = 0): bool {
+    if ($depth >= 64) {
+      return true;
+    }
     $current = $segment;
     for ($i = 0; $i < 64; $i++) {
       // 线性折叠任意层数的 %25（如 %25252e -> %2e），避免对长路径重复全量扫描
@@ -447,7 +476,8 @@ class Renderer {
       // 若解码出了新的斜杠，仅继续检查含 % 的子段
       if (strpos($decoded, '/') !== false) {
         foreach (explode('/', $decoded) as $sub) {
-          if ($sub !== '' && strpos($sub, '%') !== false && self::segmentDecodesToTraversal($sub)) {
+          if ($sub !== '' && strpos($sub, '%') !== false &&
+              self::segmentDecodesToTraversal($sub, $depth + 1)) {
             return true;
           }
         }
@@ -562,13 +592,13 @@ class Renderer {
       $host = implode('.', $labels);
     }
 
-    // 浏览器仅将单个末尾点视为规范 FQDN，连续点（如 example.com..）为非法主机名
+    // 浏览器仅将单个末尾点视为规范 FQDN，连续点（如 example.com..）及控制/保留字符均为非法主机名
     if (str_ends_with($host, '.')) {
       $host = substr($host, 0, -1);
     }
     if ($host === '' || strlen($host) > self::MAX_HOST_LENGTH || $host[0] === '.' ||
         str_ends_with($host, '.') || strpos($host, '..') !== false ||
-        preg_match('/[\s\/\\\\@:]/', $host)) {
+        preg_match('/[\x00-\x1f\x7f\s\/\\\\@:?#\[\]<>^`{|}]/', $host)) {
       return null;
     }
 
