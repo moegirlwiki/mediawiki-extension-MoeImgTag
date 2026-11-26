@@ -4,5 +4,6 @@
   "imgtag-empty-src": "The <code>src</code> attribute is not set.",
   "imgtag-invalid-src": "Invalid <code>src</code> attribute.",
   "imgtag-not-whitelisted-src": "The <code>src</code> attribute is not whitelisted.",
-  "imgtag-blacklisted-src": "The <code>src</code> attribute is blacklisted."
+  "imgtag-blacklisted-src": "The <code>src</code> attribute is blacklisted.",
+  "imgtag-invalid-config": "Invalid MoeImgTag whitelist or blacklist configuration. Please contact a site administrator."
 }

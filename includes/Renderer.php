@@ -11,6 +11,9 @@ use MediaWiki\Parser\Sanitizer;
 
 class Renderer {
   const IMG_SELF_CLOSING_MARK = 'data-img-unsafe-self-closing';
+  private const MAX_HOST_LENGTH = 253;
+  private const MAX_RAW_HOST_LENGTH = 1024;
+  private static array $loggedConfigErrors = [];
 
   public static function createImgElement(array $attribs = []) {
     $src = $attribs['src'] ?? '';
@@ -144,6 +147,11 @@ class Renderer {
       return $status->newFatal('imgtag-empty-src');
     }
 
+    // 禁止 ASCII 控制字符，防止绕过协议与域名校验
+    if (preg_match('/[\x00-\x1f\x7f]/', $src)) {
+      return $status->newFatal('imgtag-invalid-src');
+    }
+
     // 禁止危险协议
     if (preg_match('/^\s*(data:|blob:|javascript:|vbscript:|file:|ftp:)/i', $src)) {
       return $status->newFatal('imgtag-invalid-src');
@@ -151,26 +159,102 @@ class Renderer {
 
     // 检查URL编码绕过
     $decodedSrc = urldecode($src);
-    if (preg_match('/^\s*(data:|blob:|javascript:|vbscript:|file:|ftp:)/i', $decodedSrc)) {
+    if (preg_match('/[\x00-\x1f\x7f]/', $decodedSrc) ||
+        preg_match('/^\s*(data:|blob:|javascript:|vbscript:|file:|ftp:)/i', $decodedSrc)) {
       return $status->newFatal('imgtag-invalid-src');
     }
 
-    $url = parse_url($src, PHP_URL_HOST);
-    if ($url === null) {
+    $normalizedForParse = self::normalizeUrlForParsing($src);
+    $parsedSrc = parse_url($normalizedForParse);
+    if ($parsedSrc === false || !isset($parsedSrc['host']) || $parsedSrc['host'] === '') {
       return $status->newFatal('imgtag-invalid-src');
     }
 
-    // Check against whitelist
-    if (!empty($whiteList) && !self::checkUrlMatch($src, $whiteList)) {
-      return $status->newFatal('imgtag-not-whitelisted-src');
+    // 仅允许 http/https 协议（以及未展开的 // 协议相对 URL），防止 gopher:/ws: 等未知协议绕过
+    if (isset($parsedSrc['scheme'])) {
+      if (!in_array(strtolower($parsedSrc['scheme']), ['http', 'https'], true)) {
+        return $status->newFatal('imgtag-invalid-src');
+      }
+    } elseif (!str_starts_with($normalizedForParse, '//')) {
+      return $status->newFatal('imgtag-invalid-src');
     }
 
-    // Check against blacklist
-    if (!empty($blackList) && self::checkUrlMatch($src, $blackList)) {
-      return $status->newFatal('imgtag-blacklisted-src');
+    if (isset($parsedSrc['port']) && ($parsedSrc['port'] < 1 || $parsedSrc['port'] > 65535)) {
+      return $status->newFatal('imgtag-invalid-src');
+    }
+
+    if (isset($parsedSrc['path']) && self::hasTraversalSegment($parsedSrc['path'])) {
+      return $status->newFatal('imgtag-invalid-src');
+    }
+
+    if (self::canonicalizeHost($parsedSrc['host']) === null) {
+      return $status->newFatal('imgtag-invalid-src');
+    }
+
+    // Check against whitelist (白名单与黑名单互斥，若同时设置则只使用白名单)
+    if (!self::validateListConfig('MoeImgTagWhitelist', $whiteList)) {
+      return $status->newFatal('imgtag-invalid-config');
+    }
+    if ($whiteList !== []) {
+      if (!self::checkUrlMatch($src, $whiteList)) {
+        return $status->newFatal('imgtag-not-whitelisted-src');
+      }
+    } else {
+      // Check against blacklist
+      if (!self::validateListConfig('MoeImgTagBlacklist', $blackList)) {
+        return $status->newFatal('imgtag-invalid-config');
+      }
+      if ($blackList !== []) {
+        if (self::checkUrlMatch($src, $blackList)) {
+          return $status->newFatal('imgtag-blacklisted-src');
+        }
+      }
     }
 
     return $status;
+  }
+
+  public static function validateConfig(): bool {
+    $conf = MediaWikiServices::getInstance()->getMainConfig();
+    $whiteListOk = self::validateListConfig('MoeImgTagWhitelist', $conf->get('MoeImgTagWhitelist'));
+    $blackListOk = self::validateListConfig('MoeImgTagBlacklist', $conf->get('MoeImgTagBlacklist'));
+    return $whiteListOk && $blackListOk;
+  }
+
+  private static function validateListConfig(string $configName, $patterns): bool {
+    if (!is_array($patterns)) {
+      self::logConfigErrorOnce(
+        $configName,
+        "Invalid \$wg{$configName} configuration: expected array, got " . gettype($patterns)
+      );
+      return false;
+    }
+
+    foreach ($patterns as $index => $pattern) {
+      if (!is_string($pattern) || self::parsePattern($pattern) === null) {
+        self::logConfigErrorOnce(
+          $configName,
+          "Invalid pattern at index {$index} in \$wg{$configName}"
+        );
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  private static function logConfigErrorOnce(string $configName, string $message): void {
+    $key = $configName . ':' . $message;
+    if (isset(self::$loggedConfigErrors[$key])) {
+      return;
+    }
+    self::$loggedConfigErrors[$key] = true;
+
+    if (class_exists(\MediaWiki\Logger\LoggerFactory::class)) {
+      \MediaWiki\Logger\LoggerFactory::getInstance('MoeImgTag')->error($message);
+    } elseif (function_exists('wfLogWarning')) {
+      wfLogWarning("[MoeImgTag] {$message}");
+    }
   }
 
   /**
@@ -197,35 +281,476 @@ class Renderer {
    * @return bool 如果 URL 匹配任意一个模式，则返回 true；否则返回 false
    */
   public static function checkUrlMatch(string $url, array $patterns): bool {
-    $parsedUrl = parse_url($url);
-    if ($parsedUrl === false || !isset($parsedUrl['host'])) {
+    if (preg_match('/[\x00-\x1f\x7f]/', $url)) {
+      return false;
+    }
+
+    $normalizedUrl = self::normalizeUrlForParsing($url);
+    $parsedUrl = parse_url($normalizedUrl);
+    if ($parsedUrl === false || !isset($parsedUrl['host']) || $parsedUrl['host'] === '') {
       return false; // 无效的 URL
     }
 
-    $host = $parsedUrl['host'];
-    $scheme = isset($parsedUrl['scheme']) ? $parsedUrl['scheme'] . '://' : '';
+    // 仅允许 http/https 协议（或未展开的 // 协议相对 URL），防止外部调用方误放行非 HTTP(S) 协议
+    if (isset($parsedUrl['scheme'])) {
+      if (!in_array(strtolower($parsedUrl['scheme']), ['http', 'https'], true)) {
+        return false;
+      }
+    } elseif (!str_starts_with($normalizedUrl, '//')) {
+      return false;
+    }
+
+    if (isset($parsedUrl['port']) && ($parsedUrl['port'] < 1 || $parsedUrl['port'] > 65535)) {
+      return false;
+    }
+
+    // 拒绝包含 .. 路径遍历段（含多次编码）的 URL
+    if (isset($parsedUrl['path']) && self::hasTraversalSegment($parsedUrl['path'])) {
+      return false;
+    }
 
     foreach ($patterns as $pattern) {
-      // 处理通配符和完整 URL
-      if (strpos($pattern, '://') !== false) {
-        // 完整 URL
-        if ($url === $pattern) {
-          return true;
-        }
-      } elseif (strpos($pattern, '*') !== false) {
-        // 带通配符的模式
-        $pattern = str_replace('*', '', $pattern); // 去掉通配符
-        if (stripos($host, $pattern) !== false) {
-          return true;
-        }
-      } else {
-        // 纯主机名
-        if ($host === $pattern) {
-          return true;
-        }
+      if (is_string($pattern) && self::matchSinglePattern($parsedUrl, $pattern)) {
+        return true;
       }
     }
 
     return false;
+  }
+
+  private static function normalizeUrlForParsing(string $url): string {
+    // 浏览器会在解析 HTTP(S) URL 前去除首尾空白与 ASCII 控制字符，并将路径/权限部中的反斜杠视为正斜杠
+    $url = trim(preg_replace('/[\x00-\x1f\x7f]/', '', $url));
+    $splitPos = strcspn($url, '?#');
+    $authorityAndPath = str_replace('\\', '/', substr($url, 0, $splitPos));
+    return $authorityAndPath . substr($url, $splitPos);
+  }
+
+  private static function parsePattern(string $pattern): ?array {
+    $pattern = trim($pattern);
+    if ($pattern === '' || preg_match('/[\x00-\x1f\x7f]/', $pattern)) {
+      return null;
+    }
+
+    $hasScheme = strpos($pattern, '://') !== false;
+    $isProtocolRelative = strpos($pattern, '//') === 0;
+    $parsedPattern = parse_url(($hasScheme || $isProtocolRelative) ? $pattern : '//' . $pattern);
+    if ($parsedPattern === false || !isset($parsedPattern['host']) || $parsedPattern['host'] === '') {
+      return null;
+    }
+
+    if (isset($parsedPattern['user']) || isset($parsedPattern['pass'])) {
+      return null;
+    }
+
+    if (isset($parsedPattern['scheme']) &&
+        !in_array(strtolower($parsedPattern['scheme']), ['http', 'https'], true)) {
+      return null;
+    }
+
+    if (isset($parsedPattern['port']) && ($parsedPattern['port'] < 1 || $parsedPattern['port'] > 65535)) {
+      return null;
+    }
+
+    if (self::canonicalizeHost($parsedPattern['host'], true) === null) {
+      return null;
+    }
+
+    if (isset($parsedPattern['path']) && self::hasTraversalSegment($parsedPattern['path'])) {
+      return null;
+    }
+
+    $parsedPattern['_isProtocolRelative'] = $isProtocolRelative;
+    return $parsedPattern;
+  }
+
+  private static function matchSinglePattern(array $parsedUrl, string $pattern): bool {
+    $parsedPattern = self::parsePattern($pattern);
+    if ($parsedPattern === null) {
+      return false;
+    }
+
+    $urlScheme = strtolower($parsedUrl['scheme'] ?? '');
+    $patternScheme = isset($parsedPattern['scheme']) ? strtolower($parsedPattern['scheme']) : null;
+
+    // 如果模式指定了协议，则必须匹配协议
+    if ($patternScheme !== null && $urlScheme !== $patternScheme) {
+      return false;
+    }
+
+    // 匹配主机名（支持通配符）
+    if (!self::matchHost($parsedUrl['host'], $parsedPattern['host'])) {
+      return false;
+    }
+
+    // 端口校验：模式指定了端口则精确匹配；模式指定了协议或使用 // 协议相对格式但省略端口时，校验是否为默认端口
+    $urlPort = $parsedUrl['port'] ?? self::getDefaultPort($urlScheme);
+    if (isset($parsedPattern['port'])) {
+      if ($urlPort !== $parsedPattern['port']) {
+        return false;
+      }
+    } elseif ($patternScheme !== null) {
+      $defaultPatternPort = self::getDefaultPort($patternScheme);
+      if ($defaultPatternPort !== null && $urlPort !== $defaultPatternPort) {
+        return false;
+      }
+    } elseif (!empty($parsedPattern['_isProtocolRelative'])) {
+      $defaultUrlPort = self::getDefaultPort($urlScheme);
+      if ($defaultUrlPort !== null && $urlPort !== $defaultUrlPort) {
+        return false;
+      }
+    }
+
+    // 如果模式指定了路径，则禁止模式中出现 .. 段并按路径段前缀匹配
+    $rawPatternPath = $parsedPattern['path'] ?? '';
+    if ($rawPatternPath !== '' && $rawPatternPath !== '/') {
+      if (self::hasTraversalSegment($rawPatternPath)) {
+        return false;
+      }
+      $patternPath = self::normalizePath($rawPatternPath);
+      if ($patternPath !== '/') {
+        $urlPath = self::normalizePath($parsedUrl['path'] ?? '/');
+        if (str_ends_with($patternPath, '/')) {
+          if (!str_starts_with($urlPath, $patternPath)) {
+            return false;
+          }
+        } else {
+          if ($urlPath !== $patternPath && !str_starts_with($urlPath, $patternPath . '/')) {
+            return false;
+          }
+        }
+      }
+    }
+
+    // 如果模式指定了查询字符串，则保留重复键并严格比对解析后的查询参数
+    if (isset($parsedPattern['query'])) {
+      if (!isset($parsedUrl['query'])) {
+        return false;
+      }
+      if (self::parseQueryPreservingDuplicates($parsedUrl['query']) !==
+          self::parseQueryPreservingDuplicates($parsedPattern['query'])) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  private static function getDefaultPort(string $scheme): ?int {
+    return match ($scheme) {
+      'http' => 80,
+      'https' => 443,
+      default => null,
+    };
+  }
+
+  private static function hasTraversalSegment(string $path): bool {
+    $path = str_replace('\\', '/', $path);
+    foreach (explode('/', $path) as $segment) {
+      if ($segment === '..') {
+        return true;
+      }
+      if (strpos($segment, '%') !== false && self::segmentDecodesToTraversal($segment)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static function segmentDecodesToTraversal(string $segment, int $depth = 0): bool {
+    if ($depth >= 64) {
+      return true;
+    }
+    $current = $segment;
+    for ($i = 0; $i < 64; $i++) {
+      // 线性折叠任意层数的 %25（如 %25252e -> %2e），避免对长路径重复全量扫描
+      $collapsed = preg_replace('/%(?:25)+([0-9a-fA-F]{2})/', '%$1', $current);
+      $decoded = str_replace('\\', '/', rawurldecode($collapsed));
+
+      if (in_array('..', explode('/', $decoded), true)) {
+        return true;
+      }
+      if ($decoded === $current || strpos($decoded, '%') === false) {
+        return false;
+      }
+      // 若解码出了新的斜杠，仅继续检查含 % 的子段
+      if (strpos($decoded, '/') !== false) {
+        foreach (explode('/', $decoded) as $sub) {
+          if ($sub !== '' && strpos($sub, '%') !== false &&
+              self::segmentDecodesToTraversal($sub, $depth + 1)) {
+            return true;
+          }
+        }
+        return false;
+      }
+      $current = $decoded;
+    }
+    // 超过极端嵌套层数直接按不安全拒绝
+    return true;
+  }
+
+  private static function normalizePath(string $path): string {
+    $path = str_replace('\\', '/', $path);
+    $trimmed = str_starts_with($path, '/') ? substr($path, 1) : $path;
+    $segments = explode('/', $trimmed);
+    $resolved = [];
+    $lastIndex = count($segments) - 1;
+    $endsWithDot = false;
+
+    foreach ($segments as $idx => $segment) {
+      // 仅对非 %25 / %2F / %5C 的转义解码，并统一保留转义的大小写形式，防止 %252F 折叠为 %2F
+      $decodedSegment = preg_replace_callback(
+        '/%[0-9a-fA-F]{2}/',
+        static function (array $m): string {
+          $upper = strtoupper($m[0]);
+          if ($upper === '%25' || $upper === '%2F' || $upper === '%5C') {
+            return $upper;
+          }
+          return rawurldecode($m[0]);
+        },
+        $segment
+      );
+      if ($decodedSegment === '.') {
+        if ($idx === $lastIndex) {
+          $endsWithDot = true;
+        }
+        continue;
+      }
+      $resolved[] = $decodedSegment;
+    }
+
+    $normalized = '/' . implode('/', $resolved);
+    if ($endsWithDot && $normalized !== '/' && !str_ends_with($normalized, '/')) {
+      $normalized .= '/';
+    }
+
+    return $normalized;
+  }
+
+  private static function parseQueryPreservingDuplicates(string $query): array {
+    if ($query === '') {
+      return [];
+    }
+    $params = [];
+    foreach (explode('&', $query) as $part) {
+      if ($part === '') {
+        continue;
+      }
+      $pair = explode('=', $part, 2);
+      $key = urldecode($pair[0]);
+      $value = isset($pair[1]) ? urldecode($pair[1]) : '';
+      $params[$key][] = $value;
+    }
+    ksort($params, SORT_STRING);
+    return $params;
+  }
+
+  private static function canonicalizeHost(string $host, bool $allowWildcard = false): ?string {
+    if ($host === '' || strlen($host) > self::MAX_RAW_HOST_LENGTH) {
+      return null;
+    }
+
+    $host = strtolower(rawurldecode($host));
+    if ($host === '' || strlen($host) > self::MAX_RAW_HOST_LENGTH) {
+      return null;
+    }
+
+    if (!$allowWildcard && strpos($host, '*') !== false) {
+      return null;
+    }
+
+    // 处理 IPv6 方括号主机名（如 [0:0:0:0:0:0:0:1] -> [::1]）
+    if (str_starts_with($host, '[') && str_ends_with($host, ']')) {
+      $ipv6 = substr($host, 1, -1);
+      $packed = @inet_pton($ipv6);
+      if ($packed === false) {
+        return null;
+      }
+      return '[' . inet_ntop($packed) . ']';
+    }
+
+    // 先处理国际化域名 (IDNA 非过渡模式)，使全角点（如 。）等字符先转换为标准 ASCII 点再做后续校验
+    if (preg_match('/[^\x00-\x7f]/', $host)) {
+      if (!function_exists('idn_to_ascii')) {
+        return null;
+      }
+      $flags = defined('IDNA_NONTRANSITIONAL_TO_ASCII') ? IDNA_NONTRANSITIONAL_TO_ASCII : IDNA_DEFAULT;
+      $labels = explode('.', $host);
+      foreach ($labels as &$label) {
+        if ($label !== '' && preg_match('/[^\x00-\x7f]/', $label)) {
+          if (strpos($label, '*') !== false) {
+            return null;
+          }
+          $idnaInfo = [];
+          $ascii = idn_to_ascii($label, $flags, INTL_IDNA_VARIANT_UTS46, $idnaInfo);
+          if ($ascii === false || ($idnaInfo['errors'] ?? 0) !== 0) {
+            return null;
+          }
+          $label = $ascii;
+        }
+      }
+      $host = implode('.', $labels);
+    }
+
+    // 浏览器仅将单个末尾点视为规范 FQDN，连续点（如 example.com..）及控制/保留字符均为非法主机名
+    if (str_ends_with($host, '.')) {
+      $host = substr($host, 0, -1);
+    }
+    if ($host === '' || strlen($host) > self::MAX_HOST_LENGTH || $host[0] === '.' ||
+        str_ends_with($host, '.') || strpos($host, '..') !== false ||
+        preg_match('/[\x00-\x1f\x7f\s\/\\\\@:?#\[\]<>^`{|}]/', $host)) {
+      return null;
+    }
+
+    // 处理浏览器兼容的 IPv4 多种写法（十进制整数、十六进制、八进制、简写等）
+    $canonicalIpv4 = self::canonicalizeIpv4($host);
+    if ($canonicalIpv4 !== null) {
+      return $canonicalIpv4;
+    }
+
+    return $host;
+  }
+
+  private static function canonicalizeIpv4(string $host): ?string {
+    $parts = explode('.', $host);
+    $count = count($parts);
+    if ($count < 1 || $count > 4) {
+      return null;
+    }
+
+    $nums = [];
+    foreach ($parts as $part) {
+      if ($part === '') {
+        return null;
+      }
+      $val = self::parseIpv4Number($part);
+      if ($val === null) {
+        return null;
+      }
+      $nums[] = $val;
+    }
+
+    for ($i = 0; $i < $count - 1; $i++) {
+      if ($nums[$i] > 255) {
+        return null;
+      }
+    }
+
+    $lastLimit = 256 ** (5 - $count);
+    if ($nums[$count - 1] >= $lastLimit) {
+      return null;
+    }
+
+    $ipv4 = $nums[$count - 1];
+    for ($i = 0; $i < $count - 1; $i++) {
+      $ipv4 += $nums[$i] * (256 ** (3 - $i));
+    }
+
+    return long2ip($ipv4);
+  }
+
+  private static function parseIpv4Number(string $input): ?int {
+    if (preg_match('/^0[xX]([0-9a-fA-F]*)$/', $input, $m)) {
+      if ($m[1] === '') {
+        return 0;
+      }
+      $val = hexdec($m[1]);
+      return is_int($val) && $val >= 0 && $val <= 0xFFFFFFFF ? $val : null;
+    }
+    if (preg_match('/^0([0-7]+)$/', $input, $m)) {
+      $val = octdec($m[1]);
+      return is_int($val) && $val >= 0 && $val <= 0xFFFFFFFF ? $val : null;
+    }
+    if (preg_match('/^[0-9]+$/', $input)) {
+      if ($input === '0') {
+        return 0;
+      }
+      if (str_starts_with($input, '0')) {
+        return null;
+      }
+      $val = (int)$input;
+      return (string)$val === $input && $val >= 0 && $val <= 0xFFFFFFFF ? $val : null;
+    }
+    return null;
+  }
+
+  private static function matchHost(string $host, string $pattern): bool {
+    $host = self::canonicalizeHost($host, false);
+    $pattern = self::canonicalizeHost($pattern, true);
+
+    if ($host === null || $pattern === null) {
+      return false;
+    }
+
+    if (strpos($pattern, '*') === false) {
+      return $host === $pattern;
+    }
+
+    // 前导 *. 通配符必须匹配至少一个非空子域名标签，不能匹配根域名本身
+    if (str_starts_with($pattern, '*.')) {
+      $rest = substr($pattern, 2);
+      if (strpos($rest, '*') === false) {
+        $suffix = '.' . $rest;
+        if (!str_ends_with($host, $suffix) || strlen($host) <= strlen($suffix)) {
+          return false;
+        }
+        $sub = substr($host, 0, -strlen($suffix));
+        return $sub !== '' && !str_ends_with($sub, '.');
+      }
+
+      // 若后续模式仍含 *（如 *.cdn.*.example.com），要求至少跳过一个非空子域名标签和点
+      $offset = 0;
+      while (($dotPos = strpos($host, '.', $offset)) !== false) {
+        if ($dotPos > 0 && $host[$dotPos - 1] !== '.' &&
+            self::matchGlob($rest, substr($host, $dotPos + 1))) {
+          return true;
+        }
+        $offset = $dotPos + 1;
+      }
+      return false;
+    }
+
+    return self::matchGlob($pattern, $host);
+  }
+
+  private static function matchGlob(string $pattern, string $text): bool {
+    $parts = explode('*', $pattern);
+    $partCount = count($parts);
+    if ($partCount === 1) {
+      return $pattern === $text;
+    }
+
+    $prefix = $parts[0];
+    if ($prefix !== '' && !str_starts_with($text, $prefix)) {
+      return false;
+    }
+    $pos = strlen($prefix);
+
+    $suffix = $parts[$partCount - 1];
+    $end = strlen($text);
+    if ($suffix !== '') {
+      if (!str_ends_with($text, $suffix)) {
+        return false;
+      }
+      $end -= strlen($suffix);
+    }
+
+    if ($pos > $end) {
+      return false;
+    }
+
+    for ($i = 1; $i < $partCount - 1; $i++) {
+      $segment = $parts[$i];
+      if ($segment === '') {
+        continue;
+      }
+      $found = strpos($text, $segment, $pos);
+      if ($found === false || $found + strlen($segment) > $end) {
+        return false;
+      }
+      $pos = $found + strlen($segment);
+    }
+
+    return true;
   }
 }
