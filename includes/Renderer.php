@@ -171,13 +171,11 @@ class Renderer {
       return $status->newFatal('imgtag-invalid-src');
     }
 
-    // 若缺少 intl 扩展且主机名含非 ASCII 字符，无法进行可靠的 IDNA 规范化，拒绝该 URL
-    $decodedHost = rawurldecode($parsedSrc['host']);
-    if (preg_match('/[^\x00-\x7f]/', $decodedHost) && !function_exists('idn_to_ascii')) {
+    if (self::canonicalizeHost($parsedSrc['host']) === null) {
       return $status->newFatal('imgtag-invalid-src');
     }
 
-    // Check against whitelist
+    // Check against whitelist (白名单与黑名单互斥，若同时设置则只使用白名单)
     if (!is_array($whiteList)) {
       return $status->newFatal('imgtag-not-whitelisted-src');
     }
@@ -185,15 +183,15 @@ class Renderer {
       if (!self::areValidPatterns($whiteList) || !self::checkUrlMatch($src, $whiteList)) {
         return $status->newFatal('imgtag-not-whitelisted-src');
       }
-    }
-
-    // Check against blacklist
-    if (!is_array($blackList)) {
-      return $status->newFatal('imgtag-blacklisted-src');
-    }
-    if ($blackList !== []) {
-      if (!self::areValidPatterns($blackList) || self::checkUrlMatch($src, $blackList)) {
+    } else {
+      // Check against blacklist
+      if (!is_array($blackList)) {
         return $status->newFatal('imgtag-blacklisted-src');
+      }
+      if ($blackList !== []) {
+        if (!self::areValidPatterns($blackList) || self::checkUrlMatch($src, $blackList)) {
+          return $status->newFatal('imgtag-blacklisted-src');
+        }
       }
     }
 
@@ -202,7 +200,7 @@ class Renderer {
 
   private static function areValidPatterns(array $patterns): bool {
     foreach ($patterns as $pattern) {
-      if (!is_string($pattern) || trim($pattern) === '') {
+      if (!is_string($pattern) || self::parsePattern($pattern) === null) {
         return false;
       }
     }
@@ -261,16 +259,33 @@ class Renderer {
     return $authorityAndPath . substr($url, $splitPos);
   }
 
-  private static function matchSinglePattern(array $parsedUrl, string $pattern): bool {
+  private static function parsePattern(string $pattern): ?array {
     $pattern = trim($pattern);
-    if ($pattern === '') {
-      return false;
+    if ($pattern === '' || preg_match('/[\x00-\x1f\x7f]/', $pattern)) {
+      return null;
     }
 
     $hasScheme = strpos($pattern, '://') !== false;
     $isProtocolRelative = strpos($pattern, '//') === 0;
     $parsedPattern = parse_url(($hasScheme || $isProtocolRelative) ? $pattern : '//' . $pattern);
     if ($parsedPattern === false || !isset($parsedPattern['host']) || $parsedPattern['host'] === '') {
+      return null;
+    }
+
+    if (self::canonicalizeHost($parsedPattern['host']) === null) {
+      return null;
+    }
+
+    if (isset($parsedPattern['path']) && self::hasTraversalSegment($parsedPattern['path'])) {
+      return null;
+    }
+
+    return $parsedPattern;
+  }
+
+  private static function matchSinglePattern(array $parsedUrl, string $pattern): bool {
+    $parsedPattern = self::parsePattern($pattern);
+    if ($parsedPattern === null) {
       return false;
     }
 
@@ -344,19 +359,44 @@ class Renderer {
   }
 
   private static function hasTraversalSegment(string $path): bool {
-    $current = $path;
-    while (true) {
-      $normalizedSeparators = str_replace('\\', '/', $current);
-      if (in_array('..', explode('/', $normalizedSeparators), true)) {
+    $path = str_replace('\\', '/', $path);
+    foreach (explode('/', $path) as $segment) {
+      if ($segment === '..') {
         return true;
       }
-      $next = rawurldecode($current);
-      if ($next === $current) {
-        break;
+      if (strpos($segment, '%') !== false && self::segmentDecodesToTraversal($segment)) {
+        return true;
       }
-      $current = $next;
     }
     return false;
+  }
+
+  private static function segmentDecodesToTraversal(string $segment): bool {
+    $current = $segment;
+    for ($i = 0; $i < 64; $i++) {
+      // 线性折叠任意层数的 %25（如 %25252e -> %2e），避免对长路径重复全量扫描
+      $collapsed = preg_replace('/%(?:25)+([0-9a-fA-F]{2})/', '%$1', $current);
+      $decoded = str_replace('\\', '/', rawurldecode($collapsed));
+
+      if (in_array('..', explode('/', $decoded), true)) {
+        return true;
+      }
+      if ($decoded === $current || strpos($decoded, '%') === false) {
+        return false;
+      }
+      // 若解码出了新的斜杠，仅继续检查含 % 的子段
+      if (strpos($decoded, '/') !== false) {
+        foreach (explode('/', $decoded) as $sub) {
+          if ($sub !== '' && strpos($sub, '%') !== false && self::segmentDecodesToTraversal($sub)) {
+            return true;
+          }
+        }
+        return false;
+      }
+      $current = $decoded;
+    }
+    // 超过极端嵌套层数直接按不安全拒绝
+    return true;
   }
 
   private static function normalizePath(string $path): string {
@@ -366,10 +406,16 @@ class Renderer {
     $resolved = [];
 
     foreach ($segments as $segment) {
-      // 仅对非斜杠字符解码，保留 %2F / %5C 与字面量斜杠的区分
+      // 仅对非 %25 / %2F / %5C 的转义解码，并统一保留转义的大小写形式，防止 %252F 折叠为 %2F
       $decodedSegment = preg_replace_callback(
-        '/%(?!2[fF]|5[cC])[0-9a-fA-F]{2}/',
-        static fn(array $m): string => rawurldecode($m[0]),
+        '/%[0-9a-fA-F]{2}/',
+        static function (array $m): string {
+          $upper = strtoupper($m[0]);
+          if ($upper === '%25' || $upper === '%2F' || $upper === '%5C') {
+            return $upper;
+          }
+          return rawurldecode($m[0]);
+        },
         $segment
       );
       if ($decodedSegment === '.') {
@@ -399,21 +445,21 @@ class Renderer {
     return $params;
   }
 
-  private static function canonicalizeHost(string $host): string {
+  private static function canonicalizeHost(string $host): ?string {
     $host = strtolower(rawurldecode($host));
     $host = rtrim($host, '.');
-    if ($host === '') {
-      return '';
+    if ($host === '' || $host[0] === '.') {
+      return null;
     }
 
     // 处理 IPv6 方括号主机名（如 [0:0:0:0:0:0:0:1] -> [::1]）
     if (str_starts_with($host, '[') && str_ends_with($host, ']')) {
       $ipv6 = substr($host, 1, -1);
       $packed = @inet_pton($ipv6);
-      if ($packed !== false) {
-        return '[' . inet_ntop($packed) . ']';
+      if ($packed === false) {
+        return null;
       }
-      return $host;
+      return '[' . inet_ntop($packed) . ']';
     }
 
     // 处理浏览器兼容的 IPv4 多种写法（十进制整数、十六进制、八进制、简写等）
@@ -422,16 +468,21 @@ class Renderer {
       return $canonicalIpv4;
     }
 
-    // 处理国际化域名 (IDNA，使用非过渡模式以匹配现代浏览器解析)
-    if (preg_match('/[^\x00-\x7f]/', $host) && function_exists('idn_to_ascii')) {
+    // 处理国际化域名 (IDNA，使用非过渡模式以匹配现代浏览器解析；转换失败直接拒绝)
+    if (preg_match('/[^\x00-\x7f]/', $host)) {
+      if (!function_exists('idn_to_ascii')) {
+        return null;
+      }
       $flags = defined('IDNA_NONTRANSITIONAL_TO_ASCII') ? IDNA_NONTRANSITIONAL_TO_ASCII : IDNA_DEFAULT;
       $labels = explode('.', $host);
       foreach ($labels as &$label) {
         if ($label !== '' && strpos($label, '*') === false && preg_match('/[^\x00-\x7f]/', $label)) {
-          $ascii = idn_to_ascii($label, $flags, INTL_IDNA_VARIANT_UTS46);
-          if ($ascii !== false) {
-            $label = $ascii;
+          $idnaInfo = [];
+          $ascii = idn_to_ascii($label, $flags, INTL_IDNA_VARIANT_UTS46, $idnaInfo);
+          if ($ascii === false || ($idnaInfo['errors'] ?? 0) !== 0) {
+            return null;
           }
+          $label = $ascii;
         }
       }
       $host = implode('.', $labels);
@@ -507,18 +558,27 @@ class Renderer {
     $host = self::canonicalizeHost($host);
     $pattern = self::canonicalizeHost($pattern);
 
-    if ($host === '' || $pattern === '' || $host[0] === '.') {
-      return false;
-    }
-
-    // 若无法通过 intl 规范化 IDN 且仍包含非 ASCII 字符，则拒绝比较
-    if ((preg_match('/[^\x00-\x7f]/', $host) || preg_match('/[^\x00-\x7f]/', $pattern)) &&
-        !function_exists('idn_to_ascii')) {
+    if ($host === null || $pattern === null) {
       return false;
     }
 
     if (strpos($pattern, '*') === false) {
       return $host === $pattern;
+    }
+
+    // 前导 *. 通配符必须匹配至少一个非空子域名标签，不能匹配根域名本身
+    if (str_starts_with($pattern, '*.')) {
+      $suffix = substr($pattern, 1);
+      if (!str_ends_with($host, $suffix) || strlen($host) <= strlen($suffix)) {
+        return false;
+      }
+      $sub = substr($host, 0, -strlen($suffix));
+      if ($sub === '' || str_ends_with($sub, '.')) {
+        return false;
+      }
+      if (strpos($suffix, '*') === false) {
+        return true;
+      }
     }
 
     return self::matchGlob($pattern, $host);
