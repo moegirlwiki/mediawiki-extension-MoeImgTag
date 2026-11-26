@@ -197,7 +197,13 @@ class Renderer {
    * @return bool 如果 URL 匹配任意一个模式，则返回 true；否则返回 false
    */
   public static function checkUrlMatch(string $url, array $patterns): bool {
-    $parsedUrl = parse_url($url);
+    // 浏览器会在解析 HTTP(S) URL 前去除 ASCII 控制字符，并将路径/权限部中的反斜杠视为正斜杠
+    $url = preg_replace('/[\x00-\x1f\x7f]/', '', $url);
+    $splitPos = strcspn($url, '?#');
+    $authorityAndPath = str_replace('\\', '/', substr($url, 0, $splitPos));
+    $normalizedUrl = $authorityAndPath . substr($url, $splitPos);
+
+    $parsedUrl = parse_url($normalizedUrl);
     if ($parsedUrl === false || !isset($parsedUrl['host']) || $parsedUrl['host'] === '') {
       return false; // 无效的 URL
     }
@@ -244,31 +250,84 @@ class Renderer {
       }
     }
 
-    // 如果模式指定了路径，则必须匹配路径前缀
-    $patternPath = $parsedPattern['path'] ?? '';
-    if ($patternPath !== '' && $patternPath !== '/') {
-      $urlPath = $parsedUrl['path'] ?? '/';
-      // 防止路径遍历绕过（如 /path/../secret）
-      if (preg_match('#(?:^|/)\.\.(?:/|$)#', $urlPath)) {
+    // 如果模式指定了路径，则解码并规范化路径后再进行前缀匹配
+    $rawPatternPath = $parsedPattern['path'] ?? '';
+    if ($rawPatternPath !== '' && $rawPatternPath !== '/') {
+      $patternPath = self::normalizePath($rawPatternPath);
+      if ($patternPath !== '/') {
+        $urlPath = self::normalizePath($parsedUrl['path'] ?? '/');
+        if (str_ends_with($patternPath, '/')) {
+          if (!str_starts_with($urlPath, $patternPath)) {
+            return false;
+          }
+        } else {
+          if ($urlPath !== $patternPath && !str_starts_with($urlPath, $patternPath . '/')) {
+            return false;
+          }
+        }
+      }
+    }
+
+    // 如果模式指定了查询字符串，则必须匹配解析后的查询参数
+    if (isset($parsedPattern['query'])) {
+      if (!isset($parsedUrl['query'])) {
         return false;
       }
-      if (str_ends_with($patternPath, '/')) {
-        if (!str_starts_with($urlPath, $patternPath)) {
-          return false;
-        }
-      } else {
-        if ($urlPath !== $patternPath && !str_starts_with($urlPath, $patternPath . '/')) {
-          return false;
-        }
+      if (self::normalizeQuery($parsedUrl['query']) !== self::normalizeQuery($parsedPattern['query'])) {
+        return false;
       }
     }
 
     return true;
   }
 
+  private static function normalizePath(string $path): string {
+    $decoded = rawurldecode($path);
+    $segments = explode('/', $decoded);
+    $resolved = [];
+
+    foreach ($segments as $segment) {
+      if ($segment === '' || $segment === '.') {
+        continue;
+      }
+      if ($segment === '..') {
+        array_pop($resolved);
+        continue;
+      }
+      $resolved[] = $segment;
+    }
+
+    $normalized = '/' . implode('/', $resolved);
+    if (str_ends_with($decoded, '/') && $normalized !== '/') {
+      $normalized .= '/';
+    }
+
+    return $normalized;
+  }
+
+  private static function normalizeQuery(string $query): array {
+    parse_str($query, $params);
+    return self::ksortRecursive($params);
+  }
+
+  private static function ksortRecursive(array $array): array {
+    ksort($array, SORT_STRING);
+    foreach ($array as $key => $value) {
+      if (is_array($value)) {
+        $array[$key] = self::ksortRecursive($value);
+      }
+    }
+    return $array;
+  }
+
+  private static function canonicalizeHost(string $host): string {
+    $host = strtolower(rawurldecode($host));
+    return rtrim($host, '.');
+  }
+
   private static function matchHost(string $host, string $pattern): bool {
-    $host = strtolower($host);
-    $pattern = strtolower($pattern);
+    $host = self::canonicalizeHost($host);
+    $pattern = self::canonicalizeHost($pattern);
 
     if ($host === '' || $pattern === '' || $host[0] === '.') {
       return false;
