@@ -144,6 +144,11 @@ class Renderer {
       return $status->newFatal('imgtag-empty-src');
     }
 
+    // 禁止 ASCII 控制字符，防止绕过协议与域名校验
+    if (preg_match('/[\x00-\x1f\x7f]/', $src)) {
+      return $status->newFatal('imgtag-invalid-src');
+    }
+
     // 禁止危险协议
     if (preg_match('/^\s*(data:|blob:|javascript:|vbscript:|file:|ftp:)/i', $src)) {
       return $status->newFatal('imgtag-invalid-src');
@@ -151,12 +156,18 @@ class Renderer {
 
     // 检查URL编码绕过
     $decodedSrc = urldecode($src);
-    if (preg_match('/^\s*(data:|blob:|javascript:|vbscript:|file:|ftp:)/i', $decodedSrc)) {
+    if (preg_match('/[\x00-\x1f\x7f]/', $decodedSrc) ||
+        preg_match('/^\s*(data:|blob:|javascript:|vbscript:|file:|ftp:)/i', $decodedSrc)) {
       return $status->newFatal('imgtag-invalid-src');
     }
 
-    $url = parse_url($src, PHP_URL_HOST);
-    if ($url === null) {
+    $normalizedForParse = self::normalizeUrlForParsing($src);
+    $parsedSrc = parse_url($normalizedForParse);
+    if ($parsedSrc === false || !isset($parsedSrc['host']) || $parsedSrc['host'] === '') {
+      return $status->newFatal('imgtag-invalid-src');
+    }
+
+    if (isset($parsedSrc['path']) && self::hasTraversalSegment($parsedSrc['path'])) {
       return $status->newFatal('imgtag-invalid-src');
     }
 
@@ -197,15 +208,15 @@ class Renderer {
    * @return bool 如果 URL 匹配任意一个模式，则返回 true；否则返回 false
    */
   public static function checkUrlMatch(string $url, array $patterns): bool {
-    // 浏览器会在解析 HTTP(S) URL 前去除 ASCII 控制字符，并将路径/权限部中的反斜杠视为正斜杠
-    $url = preg_replace('/[\x00-\x1f\x7f]/', '', $url);
-    $splitPos = strcspn($url, '?#');
-    $authorityAndPath = str_replace('\\', '/', substr($url, 0, $splitPos));
-    $normalizedUrl = $authorityAndPath . substr($url, $splitPos);
-
+    $normalizedUrl = self::normalizeUrlForParsing($url);
     $parsedUrl = parse_url($normalizedUrl);
     if ($parsedUrl === false || !isset($parsedUrl['host']) || $parsedUrl['host'] === '') {
       return false; // 无效的 URL
+    }
+
+    // 拒绝包含 .. 路径遍历段（含多次编码）的 URL
+    if (isset($parsedUrl['path']) && self::hasTraversalSegment($parsedUrl['path'])) {
+      return false;
     }
 
     foreach ($patterns as $pattern) {
@@ -215,6 +226,14 @@ class Renderer {
     }
 
     return false;
+  }
+
+  private static function normalizeUrlForParsing(string $url): string {
+    // 浏览器会在解析 HTTP(S) URL 前去除 ASCII 控制字符，并将路径/权限部中的反斜杠视为正斜杠
+    $url = preg_replace('/[\x00-\x1f\x7f]/', '', $url);
+    $splitPos = strcspn($url, '?#');
+    $authorityAndPath = str_replace('\\', '/', substr($url, 0, $splitPos));
+    return $authorityAndPath . substr($url, $splitPos);
   }
 
   private static function matchSinglePattern(array $parsedUrl, string $pattern): bool {
@@ -230,12 +249,12 @@ class Renderer {
       return false;
     }
 
+    $urlScheme = strtolower($parsedUrl['scheme'] ?? '');
+    $patternScheme = isset($parsedPattern['scheme']) ? strtolower($parsedPattern['scheme']) : null;
+
     // 如果模式指定了协议，则必须匹配协议
-    if (isset($parsedPattern['scheme'])) {
-      $urlScheme = strtolower($parsedUrl['scheme'] ?? '');
-      if ($urlScheme !== strtolower($parsedPattern['scheme'])) {
-        return false;
-      }
+    if ($patternScheme !== null && $urlScheme !== $patternScheme) {
+      return false;
     }
 
     // 匹配主机名（支持通配符）
@@ -243,16 +262,25 @@ class Renderer {
       return false;
     }
 
-    // 如果模式指定了端口，则必须匹配端口
+    // 端口校验：模式指定了端口则精确匹配；模式指定了协议但未指定端口时，校验是否为该协议默认端口
+    $urlPort = $parsedUrl['port'] ?? self::getDefaultPort($urlScheme);
     if (isset($parsedPattern['port'])) {
-      if (($parsedUrl['port'] ?? null) !== $parsedPattern['port']) {
+      if ($urlPort !== $parsedPattern['port']) {
+        return false;
+      }
+    } elseif ($patternScheme !== null) {
+      $defaultPatternPort = self::getDefaultPort($patternScheme);
+      if ($defaultPatternPort !== null && $urlPort !== $defaultPatternPort) {
         return false;
       }
     }
 
-    // 如果模式指定了路径，则解码并规范化路径后再进行前缀匹配
+    // 如果模式指定了路径，则禁止模式中出现 .. 段并按路径段前缀匹配
     $rawPatternPath = $parsedPattern['path'] ?? '';
     if ($rawPatternPath !== '' && $rawPatternPath !== '/') {
+      if (self::hasTraversalSegment($rawPatternPath)) {
+        return false;
+      }
       $patternPath = self::normalizePath($rawPatternPath);
       if ($patternPath !== '/') {
         $urlPath = self::normalizePath($parsedUrl['path'] ?? '/');
@@ -268,17 +296,41 @@ class Renderer {
       }
     }
 
-    // 如果模式指定了查询字符串，则必须匹配解析后的查询参数
+    // 如果模式指定了查询字符串，则保留重复键并严格比对解析后的查询参数
     if (isset($parsedPattern['query'])) {
       if (!isset($parsedUrl['query'])) {
         return false;
       }
-      if (self::normalizeQuery($parsedUrl['query']) !== self::normalizeQuery($parsedPattern['query'])) {
+      if (self::parseQueryPreservingDuplicates($parsedUrl['query']) !==
+          self::parseQueryPreservingDuplicates($parsedPattern['query'])) {
         return false;
       }
     }
 
     return true;
+  }
+
+  private static function getDefaultPort(string $scheme): ?int {
+    return match ($scheme) {
+      'http' => 80,
+      'https' => 443,
+      default => null,
+    };
+  }
+
+  private static function hasTraversalSegment(string $path): bool {
+    $current = $path;
+    for ($i = 0; $i < 10; $i++) {
+      if (in_array('..', explode('/', $current), true)) {
+        return true;
+      }
+      $next = rawurldecode($current);
+      if ($next === $current) {
+        break;
+      }
+      $current = $next;
+    }
+    return in_array('..', explode('/', $current), true);
   }
 
   private static function normalizePath(string $path): string {
@@ -288,10 +340,6 @@ class Renderer {
 
     foreach ($segments as $segment) {
       if ($segment === '' || $segment === '.') {
-        continue;
-      }
-      if ($segment === '..') {
-        array_pop($resolved);
         continue;
       }
       $resolved[] = $segment;
@@ -305,24 +353,122 @@ class Renderer {
     return $normalized;
   }
 
-  private static function normalizeQuery(string $query): array {
-    parse_str($query, $params);
-    return self::ksortRecursive($params);
-  }
-
-  private static function ksortRecursive(array $array): array {
-    ksort($array, SORT_STRING);
-    foreach ($array as $key => $value) {
-      if (is_array($value)) {
-        $array[$key] = self::ksortRecursive($value);
-      }
+  private static function parseQueryPreservingDuplicates(string $query): array {
+    if ($query === '') {
+      return [];
     }
-    return $array;
+    $params = [];
+    foreach (explode('&', $query) as $part) {
+      if ($part === '') {
+        continue;
+      }
+      $pair = explode('=', $part, 2);
+      $key = urldecode($pair[0]);
+      $value = isset($pair[1]) ? urldecode($pair[1]) : '';
+      $params[$key][] = $value;
+    }
+    ksort($params, SORT_STRING);
+    return $params;
   }
 
   private static function canonicalizeHost(string $host): string {
     $host = strtolower(rawurldecode($host));
-    return rtrim($host, '.');
+    $host = rtrim($host, '.');
+    if ($host === '') {
+      return '';
+    }
+
+    // 处理 IPv6 方括号主机名（如 [0:0:0:0:0:0:0:1] -> [::1]）
+    if (str_starts_with($host, '[') && str_ends_with($host, ']')) {
+      $ipv6 = substr($host, 1, -1);
+      $packed = @inet_pton($ipv6);
+      if ($packed !== false) {
+        return '[' . inet_ntop($packed) . ']';
+      }
+      return $host;
+    }
+
+    // 处理浏览器兼容的 IPv4 多种写法（十进制整数、十六进制、八进制、简写等）
+    $canonicalIpv4 = self::canonicalizeIpv4($host);
+    if ($canonicalIpv4 !== null) {
+      return $canonicalIpv4;
+    }
+
+    // 处理国际化域名 (IDNA)
+    if (preg_match('/[^\x00-\x7f]/', $host) && function_exists('idn_to_ascii')) {
+      $labels = explode('.', $host);
+      foreach ($labels as &$label) {
+        if ($label !== '' && strpos($label, '*') === false && preg_match('/[^\x00-\x7f]/', $label)) {
+          $ascii = idn_to_ascii($label, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
+          if ($ascii !== false) {
+            $label = $ascii;
+          }
+        }
+      }
+      $host = implode('.', $labels);
+    }
+
+    return $host;
+  }
+
+  private static function canonicalizeIpv4(string $host): ?string {
+    $parts = explode('.', $host);
+    $count = count($parts);
+    if ($count < 1 || $count > 4) {
+      return null;
+    }
+
+    $nums = [];
+    foreach ($parts as $part) {
+      if ($part === '') {
+        return null;
+      }
+      $val = self::parseIpv4Number($part);
+      if ($val === null) {
+        return null;
+      }
+      $nums[] = $val;
+    }
+
+    for ($i = 0; $i < $count - 1; $i++) {
+      if ($nums[$i] > 255) {
+        return null;
+      }
+    }
+
+    $lastLimit = 256 ** (5 - $count);
+    if ($nums[$count - 1] >= $lastLimit) {
+      return null;
+    }
+
+    $ipv4 = $nums[$count - 1];
+    for ($i = 0; $i < $count - 1; $i++) {
+      $ipv4 += $nums[$i] * (256 ** (3 - $i));
+    }
+
+    return long2ip($ipv4);
+  }
+
+  private static function parseIpv4Number(string $input): ?int {
+    if (preg_match('/^0[xX]([0-9a-fA-F]+)$/', $input, $m)) {
+      $val = hexdec($m[1]);
+      return is_int($val) && $val >= 0 && $val <= 0xFFFFFFFF ? $val : null;
+    }
+    if (preg_match('/^0([0-7]+)$/', $input, $m)) {
+      $val = octdec($m[1]);
+      return is_int($val) && $val >= 0 && $val <= 0xFFFFFFFF ? $val : null;
+    }
+    if (preg_match('/^[0-9]+$/', $input)) {
+      if ($input === '0') {
+        return 0;
+      }
+      if (str_starts_with($input, '0')) {
+        return null;
+      }
+      $val = (int)$input;
+      return (string)$val === $input && $val >= 0 && $val <= 0xFFFFFFFF ? $val : null;
+    }
+    return null;
   }
 
   private static function matchHost(string $host, string $pattern): bool {
