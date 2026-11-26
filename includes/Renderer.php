@@ -178,15 +178,21 @@ class Renderer {
     }
 
     // Check against whitelist
-    if (!empty($whiteList)) {
-      if (!is_array($whiteList) || !self::areValidPatterns($whiteList) || !self::checkUrlMatch($src, $whiteList)) {
+    if (!is_array($whiteList)) {
+      return $status->newFatal('imgtag-not-whitelisted-src');
+    }
+    if ($whiteList !== []) {
+      if (!self::areValidPatterns($whiteList) || !self::checkUrlMatch($src, $whiteList)) {
         return $status->newFatal('imgtag-not-whitelisted-src');
       }
     }
 
     // Check against blacklist
-    if (!empty($blackList)) {
-      if (!is_array($blackList) || !self::areValidPatterns($blackList) || self::checkUrlMatch($src, $blackList)) {
+    if (!is_array($blackList)) {
+      return $status->newFatal('imgtag-blacklisted-src');
+    }
+    if ($blackList !== []) {
+      if (!self::areValidPatterns($blackList) || self::checkUrlMatch($src, $blackList)) {
         return $status->newFatal('imgtag-blacklisted-src');
       }
     }
@@ -354,23 +360,25 @@ class Renderer {
   }
 
   private static function normalizePath(string $path): string {
-    $decoded = str_replace('\\', '/', rawurldecode($path));
-    $segments = explode('/', $decoded);
+    $path = str_replace('\\', '/', $path);
+    $trimmed = str_starts_with($path, '/') ? substr($path, 1) : $path;
+    $segments = explode('/', $trimmed);
     $resolved = [];
 
     foreach ($segments as $segment) {
-      if ($segment === '' || $segment === '.') {
+      // 仅对非斜杠字符解码，保留 %2F / %5C 与字面量斜杠的区分
+      $decodedSegment = preg_replace_callback(
+        '/%(?!2[fF]|5[cC])[0-9a-fA-F]{2}/',
+        static fn(array $m): string => rawurldecode($m[0]),
+        $segment
+      );
+      if ($decodedSegment === '.') {
         continue;
       }
-      $resolved[] = $segment;
+      $resolved[] = $decodedSegment;
     }
 
-    $normalized = '/' . implode('/', $resolved);
-    if (str_ends_with($decoded, '/') && $normalized !== '/') {
-      $normalized .= '/';
-    }
-
-    return $normalized;
+    return '/' . implode('/', $resolved);
   }
 
   private static function parseQueryPreservingDuplicates(string $query): array {
@@ -513,7 +521,38 @@ class Renderer {
       return $host === $pattern;
     }
 
-    $regex = '/^' . str_replace('\*', '.*', preg_quote($pattern, '/')) . '$/';
-    return preg_match($regex, $host) === 1;
+    return self::matchGlob($pattern, $host);
+  }
+
+  private static function matchGlob(string $pattern, string $text): bool {
+    $pLen = strlen($pattern);
+    $tLen = strlen($text);
+    $p = 0;
+    $t = 0;
+    $starIdx = -1;
+    $matchIdx = 0;
+
+    while ($t < $tLen) {
+      if ($p < $pLen && $pattern[$p] === $text[$t]) {
+        $p++;
+        $t++;
+      } elseif ($p < $pLen && $pattern[$p] === '*') {
+        $starIdx = $p;
+        $matchIdx = $t;
+        $p++;
+      } elseif ($starIdx !== -1) {
+        $p = $starIdx + 1;
+        $matchIdx++;
+        $t = $matchIdx;
+      } else {
+        return false;
+      }
+    }
+
+    while ($p < $pLen && $pattern[$p] === '*') {
+      $p++;
+    }
+
+    return $p === $pLen;
   }
 }
