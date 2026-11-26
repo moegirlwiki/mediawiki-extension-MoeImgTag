@@ -198,34 +198,87 @@ class Renderer {
    */
   public static function checkUrlMatch(string $url, array $patterns): bool {
     $parsedUrl = parse_url($url);
-    if ($parsedUrl === false || !isset($parsedUrl['host'])) {
+    if ($parsedUrl === false || !isset($parsedUrl['host']) || $parsedUrl['host'] === '') {
       return false; // 无效的 URL
     }
 
-    $host = $parsedUrl['host'];
-    $scheme = isset($parsedUrl['scheme']) ? $parsedUrl['scheme'] . '://' : '';
-
     foreach ($patterns as $pattern) {
-      // 处理通配符和完整 URL
-      if (strpos($pattern, '://') !== false) {
-        // 完整 URL
-        if ($url === $pattern) {
-          return true;
-        }
-      } elseif (strpos($pattern, '*') !== false) {
-        // 带通配符的模式
-        $pattern = str_replace('*', '', $pattern); // 去掉通配符
-        if (stripos($host, $pattern) !== false) {
-          return true;
-        }
-      } else {
-        // 纯主机名
-        if ($host === $pattern) {
-          return true;
-        }
+      if (is_string($pattern) && self::matchSinglePattern($parsedUrl, $pattern)) {
+        return true;
       }
     }
 
     return false;
+  }
+
+  private static function matchSinglePattern(array $parsedUrl, string $pattern): bool {
+    $pattern = trim($pattern);
+    if ($pattern === '') {
+      return false;
+    }
+
+    $hasScheme = strpos($pattern, '://') !== false;
+    $isProtocolRelative = strpos($pattern, '//') === 0;
+    $parsedPattern = parse_url(($hasScheme || $isProtocolRelative) ? $pattern : '//' . $pattern);
+    if ($parsedPattern === false || !isset($parsedPattern['host']) || $parsedPattern['host'] === '') {
+      return false;
+    }
+
+    // 如果模式指定了协议，则必须匹配协议
+    if (isset($parsedPattern['scheme'])) {
+      $urlScheme = strtolower($parsedUrl['scheme'] ?? '');
+      if ($urlScheme !== strtolower($parsedPattern['scheme'])) {
+        return false;
+      }
+    }
+
+    // 匹配主机名（支持通配符）
+    if (!self::matchHost($parsedUrl['host'], $parsedPattern['host'])) {
+      return false;
+    }
+
+    // 如果模式指定了端口，则必须匹配端口
+    if (isset($parsedPattern['port'])) {
+      if (($parsedUrl['port'] ?? null) !== $parsedPattern['port']) {
+        return false;
+      }
+    }
+
+    // 如果模式指定了路径，则必须匹配路径前缀
+    $patternPath = $parsedPattern['path'] ?? '';
+    if ($patternPath !== '' && $patternPath !== '/') {
+      $urlPath = $parsedUrl['path'] ?? '/';
+      // 防止路径遍历绕过（如 /path/../secret）
+      if (preg_match('#(?:^|/)\.\.(?:/|$)#', $urlPath)) {
+        return false;
+      }
+      if (str_ends_with($patternPath, '/')) {
+        if (!str_starts_with($urlPath, $patternPath)) {
+          return false;
+        }
+      } else {
+        if ($urlPath !== $patternPath && !str_starts_with($urlPath, $patternPath . '/')) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  private static function matchHost(string $host, string $pattern): bool {
+    $host = strtolower($host);
+    $pattern = strtolower($pattern);
+
+    if ($host === '' || $pattern === '' || $host[0] === '.') {
+      return false;
+    }
+
+    if (strpos($pattern, '*') === false) {
+      return $host === $pattern;
+    }
+
+    $regex = '/^' . str_replace('\*', '.*', preg_quote($pattern, '/')) . '$/';
+    return preg_match($regex, $host) === 1;
   }
 }
