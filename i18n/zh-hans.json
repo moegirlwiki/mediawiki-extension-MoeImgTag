@@ -1,5 +1,5 @@
 {
-  "imgtag-desc": "允许在高版本 MediaWiki 中安全的插入 <code>&lt;img&gt;</code> 标签。",
+  "imgtag-desc": "允许在高版本 MediaWiki 中安全地插入 <code>&lt;img&gt;</code> 标签。",
   "imgtag-invalid": "插入 <code>&lt;img&gt;</code> 时出现问题{{#if: $1 |：$1 | 请检查参数。 }}",
   "imgtag-empty-src": "未设置 <code>src</code> 属性。",
   "imgtag-invalid-src": "无效的 <code>src</code> 属性",
